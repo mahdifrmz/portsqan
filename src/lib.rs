@@ -1,4 +1,8 @@
-use std::{thread::JoinHandle, vec};
+use std::{
+    sync::{Arc, Mutex},
+    thread::JoinHandle,
+    vec,
+};
 
 use crossbeam::{
     channel::{Receiver, Sender},
@@ -216,7 +220,7 @@ pub enum Output {
     Term,
     Scan(Port, PortState),
 }
-struct Scanner {
+struct ScanMaster {
     workers: Vec<WorkerHandle>,
     message_rx: Receiver<WorkerMessage>,
     message_tx: Sender<WorkerMessage>,
@@ -228,14 +232,14 @@ struct Scanner {
     id_counter: usize,
 }
 
-impl Scanner {
-    fn new() -> (Scanner, Receiver<Output>, Sender<Input>) {
+impl ScanMaster {
+    fn new() -> (ScanMaster, Receiver<Output>, Sender<Input>) {
         let (message_tx, message_rx) = crossbeam::channel::unbounded();
         let (input_tx, input_rx) = crossbeam::channel::unbounded();
         let (output_tx, output_rx) = crossbeam::channel::unbounded();
         let workers = vec![];
         let ranges = PortIter::new(vec![]);
-        let scanner = Scanner {
+        let scanner = ScanMaster {
             workers,
             message_rx,
             message_tx,
@@ -359,7 +363,7 @@ impl Scanner {
     fn drop_input_channel(&mut self) {
         self.input_rx = crossbeam::channel::never();
     }
-    fn listen(&mut self) -> Vec<(Port, PortState)> {
+    fn listen(&mut self) {
         let message_rx = self.message_rx.clone();
         let input_rx = self.input_rx.clone();
         while self.state != ScannerState::Terminated {
@@ -373,12 +377,33 @@ impl Scanner {
                 },
             };
         }
-        vec![]
     }
 }
 
-pub fn scan() -> Vec<(Port, PortState)> {
-    let (mut scanner, _, _) = Scanner::new();
-    let ouput = scanner.listen();
-    ouput
+#[derive(Clone)]
+pub struct Scanner {
+    tx: Sender<Input>,
+    rx: Receiver<Output>,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl Scanner {
+    pub fn new() -> Scanner {
+        let (mut scan_master, rx, tx) = ScanMaster::new();
+        let handle = std::thread::spawn(move || {
+            scan_master.listen();
+        });
+        let handle = Arc::new(Mutex::new(Some(handle)));
+        Scanner { rx, tx, handle }
+    }
+
+    pub fn read(&self) -> Option<Output> {
+        self.rx.recv().ok()
+    }
+    pub fn write(&self, input: Input) -> Option<()> {
+        self.tx.send(input).ok()
+    }
+    pub fn destroy(&self) -> Option<()> {
+        self.handle.lock().ok()?.take()?.join().ok()
+    }
 }

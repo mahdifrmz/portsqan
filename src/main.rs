@@ -1,5 +1,5 @@
-use portsqan::{scan, ScannerConfig};
+use portsqan::Scanner;
 
 fn main() {
-    scan();
+    let scanner = Scanner::new();
 }
