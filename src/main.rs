@@ -1,3 +1,5 @@
+use portsqan::Scanner;
+
 fn main() {
-    println!("Hello, world!");
+    Scanner::new().scan(vec![]);
 }
