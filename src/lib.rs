@@ -40,7 +40,7 @@ pub enum PortState {
 #[derive(Default)]
 pub struct ScannerConfig {
     thread_count: usize,
-    command_rx: Option<Receiver<Command>>,
+    input_rx: Option<Receiver<Input>>,
 }
 
 impl ScannerConfig {
@@ -49,13 +49,14 @@ impl ScannerConfig {
         s.thread_count = thread_count;
         s
     }
-    pub fn command_rx(self, command_rx: Receiver<Command>) -> ScannerConfig {
+    pub fn input_rx(self, input_rx: Receiver<Input>) -> ScannerConfig {
         let mut s = self;
-        s.command_rx = Some(command_rx);
+        s.input_rx = Some(input_rx);
         s
     }
 }
 
+#[derive(Default)]
 struct PortIter {
     range_index: usize,
     port_index: usize,
@@ -105,8 +106,7 @@ struct WorkerMessage {
 }
 
 enum Message {
-    Quit,
-    Scan(PortState),
+    Scan(Port, PortState),
     Error,
 }
 
@@ -116,6 +116,48 @@ struct Worker {
     message_tx: Sender<WorkerMessage>,
 }
 
+struct WorkerHandle {
+    id: WorkerId,
+    state: WorkerState,
+    work_tx: Sender<Instruction>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl WorkerHandle {
+    fn is_idle(&self) -> bool {
+        self.state == WorkerState::Idle
+    }
+    fn is_working(&self) -> bool {
+        self.state == WorkerState::Working
+    }
+    fn join(&mut self) {
+        if let Some(h) = self.join_handle.take() {
+            h.join()
+                .expect(format!("FATAL: Worker #{} has paniced!", self.id).as_str());
+        }
+    }
+    fn send_instruction(&self, instruction: Instruction) {
+        self.work_tx.send(instruction).expect(
+            "FATAL: Scanner failed to send instruction. \
+        The thread has been probably terminated too early, or either the instruction is late.",
+        )
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum WorkerState {
+    Term,
+    Working,
+    Idle,
+}
+#[derive(PartialEq, Eq)]
+enum ScannerState {
+    Ending,
+    Terminated,
+    Stop,
+    Running,
+}
+
 impl Worker {
     fn send_message(&self, message: Message) {
         self.message_tx
@@ -123,13 +165,16 @@ impl Worker {
                 worker_id: self.id,
                 content: message,
             })
-            .unwrap();
+            .expect(
+                "FATAL: Worker thread failed to send message. \
+The channel has been probably closed by the scanner too early.",
+            );
     }
     fn tcp(&self, host: String, number: u16) -> Option<bool> {
-        None
+        todo!()
     }
     fn udp(&self, host: String, number: u16) -> Option<bool> {
-        None
+        todo!()
     }
     fn run(&self) {
         loop {
@@ -153,10 +198,9 @@ impl Worker {
                         Some(false) => PortState::Closed,
                         None => PortState::Unreachable,
                     };
-                    self.send_message(Message::Scan(scan));
+                    self.send_message(Message::Scan(port, scan));
                 }
                 Instruction::Term => {
-                    self.send_message(Message::Quit);
                     break;
                 }
             }
@@ -164,96 +208,150 @@ impl Worker {
     }
 }
 
-pub enum Command {
+pub enum Input {
     Stop,
     Cont,
+    End,
 }
 
 struct Scanner {
-    worker_tx: Vec<Sender<Instruction>>,
+    workers: Vec<WorkerHandle>,
     message_rx: Receiver<WorkerMessage>,
-    command_rx: Receiver<Command>,
+    input_rx: Receiver<Input>,
     ranges: PortIter,
     config: ScannerConfig,
-    handles: Vec<JoinHandle<()>>,
+    state: ScannerState,
+    output: Vec<(Port, PortState)>,
 }
 
 impl Scanner {
     fn new(ranges: Vec<PortRange>, config: ScannerConfig) -> Scanner {
         let (message_tx, message_rx) = crossbeam::channel::unbounded();
-        let command_rx = config
-            .command_rx
+        let input_rx = config
+            .input_rx
             .clone()
-            .unwrap_or(crossbeam::channel::bounded(1).1);
+            .unwrap_or(crossbeam::channel::never());
         let worker_count = config.thread_count as usize;
-        let mut worker_tx = vec![];
-        let handles = (0..worker_count)
-            .map(|i| {
-                let (work_tx, work_rx) = crossbeam::channel::unbounded();
+        let workers = (0..worker_count)
+            .map(|id| {
+                let (work_tx, work_rx) = crossbeam::channel::bounded(1);
                 let message_tx = message_tx.clone();
-                worker_tx.push(work_tx);
-                std::thread::spawn(move || {
-                    let worker = Worker {
-                        id: i as WorkerId,
-                        work_rx,
-                        message_tx,
-                    };
-                    worker.run();
-                })
+                WorkerHandle {
+                    id,
+                    work_tx,
+                    state: WorkerState::Working,
+                    join_handle: Some(std::thread::spawn(move || {
+                        let worker = Worker {
+                            id,
+                            work_rx,
+                            message_tx,
+                        };
+                        worker.run();
+                    })),
+                }
             })
             .collect::<Vec<_>>();
 
         let ranges = PortIter::new(ranges);
+
         Scanner {
-            command_rx,
-            worker_tx,
+            workers,
+            input_rx,
             message_rx,
             ranges,
             config,
-            handles,
+            state: ScannerState::Running,
+            output: vec![],
         }
-    }
-    fn send_instruction(&self, worker_id: WorkerId, instruction: Instruction) {
-        self.worker_tx[worker_id].send(instruction).unwrap();
     }
     fn host(&mut self, host: String) {
-        for i in 0..self.config.thread_count {
-            self.send_instruction(i, Instruction::Host(host.clone()));
+        for wh in self.workers.iter_mut() {
+            wh.send_instruction(Instruction::Host(host.clone()));
         }
     }
-    fn terminate(&mut self) {
-        for i in 0..self.config.thread_count {
-            self.send_instruction(i, Instruction::Term);
+    fn try_terminate(&mut self) -> bool {
+        let mut success = true;
+        for wh in self.workers.iter_mut() {
+            if wh.is_idle() {
+                wh.state = WorkerState::Term;
+                wh.send_instruction(Instruction::Term);
+                wh.join();
+            } else if wh.is_working() {
+                success = false;
+            }
+        }
+        return success;
+    }
+    fn handle_message(&mut self, message: WorkerMessage) {
+        match message.content {
+            Message::Scan(port, state) => {
+                let worker_id = message.worker_id;
+                self.workers[worker_id].state = WorkerState::Idle;
+                self.output.push((port, state));
+                if self.state == ScannerState::Running {
+                    self.assign_work();
+                } else if self.state == ScannerState::Ending {
+                    self.try_terminate();
+                }
+            }
+            Message::Error => panic!("server assigned jobs before setting a Host"),
         }
     }
-    fn join(&mut self) {
-        for h in self.handles.drain(..) {
-            h.join().unwrap();
+    fn handle_input(&mut self, input: Input) {
+        match input {
+            Input::End => self.state = ScannerState::Ending,
+            Input::Stop => {
+                if self.state == ScannerState::Running {
+                    self.state = ScannerState::Stop;
+                }
+            }
+            Input::Cont => {
+                if self.state == ScannerState::Stop {
+                    self.state = ScannerState::Running;
+                }
+                self.assign_work()
+            }
         }
     }
-    fn handle_message(&mut self, message: WorkerMessage) -> bool {
-        false
+    fn assign_work(&mut self) {
+        let mut ranges = std::mem::take(&mut self.ranges);
+        for wh in self.workers.iter_mut() {
+            if wh.is_idle() {
+                match ranges.next() {
+                    Some(port) => {
+                        wh.send_instruction(Instruction::Port(port));
+                        wh.state = WorkerState::Working;
+                    }
+                    None => todo!(),
+                }
+            }
+        }
+        self.ranges = ranges;
     }
-    fn handle_command(&mut self, command: Command) -> bool {
-        false
+    fn drop_input_channel(&mut self) {
+        self.input_rx = crossbeam::channel::never();
     }
-    fn run(&mut self) {
+    fn listen(&mut self) -> Vec<(Port, PortState)> {
         let message_rx = self.message_rx.clone();
-        let command_rx = self.command_rx.clone();
-        let mut term = false;
-        while !term {
+        let input_rx = self.input_rx.clone();
+        while self.state != ScannerState::Terminated {
             select! {
-                recv(message_rx) -> message => term = self.handle_message(message.unwrap()),
-                recv(command_rx) -> command => term = self.handle_command(command.unwrap()),
+                recv(message_rx) -> message => self.handle_message(message.expect(
+                    "FATAL: Scanner failed to receive message. \
+            The thread has been probably terminated too early, or either the recv call is late.")),
+                recv(input_rx) -> input => match input {
+                    Err(_) => self.drop_input_channel(),
+                    Ok(input) => self.handle_input(input),
+                },
             };
         }
+        vec![]
     }
 }
 
-pub fn scan(host: String, ranges: Vec<PortRange>, config: ScannerConfig) {
+pub fn scan(host: String, ranges: Vec<PortRange>, config: ScannerConfig) -> Vec<(Port, PortState)> {
     let mut scanner = Scanner::new(ranges, config);
     scanner.host(host);
-    scanner.run();
-    scanner.terminate();
-    scanner.join();
+    let ouput = scanner.listen();
+    ouput
 }
