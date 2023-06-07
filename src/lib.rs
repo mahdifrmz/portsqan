@@ -15,13 +15,14 @@ pub enum Protocol {
     Udp,
 }
 
-pub struct PortRange {
+pub struct AddressRange {
+    host: String,
     protocol: Protocol,
     from: u16,
     to: u16,
 }
 
-impl PortRange {
+impl AddressRange {
     fn len(&self) -> usize {
         (self.to - self.from + 1) as usize
     }
@@ -55,21 +56,21 @@ impl ScannerConfig {
 }
 
 #[derive(Default)]
-struct PortIter {
+struct AddressIter {
     range_index: usize,
     port_index: usize,
-    ranges: Vec<PortRange>,
+    ranges: Vec<AddressRange>,
 }
 
-impl PortIter {
-    fn new(ranges: Vec<PortRange>) -> PortIter {
-        PortIter {
+impl AddressIter {
+    fn new(ranges: Vec<AddressRange>) -> AddressIter {
+        AddressIter {
             range_index: 0,
             port_index: 0,
             ranges,
         }
     }
-    fn next(&mut self) -> Option<Port> {
+    fn next(&mut self) -> Option<Address> {
         let range = &self.ranges[self.range_index];
         if self.port_index == range.len() {
             if self.range_index == self.ranges.len() - 1 {
@@ -84,15 +85,19 @@ impl PortIter {
                 protocol: range.protocol,
                 number: range.nth(self.port_index),
             };
+            let host = range.host.clone();
             self.port_index += 1;
-            Some(port)
+            Some((host, port))
         }
     }
 }
 
+type Host = String;
+
+type Address = (Host, Port);
+
 enum Instruction {
-    Host(String),
-    Port(Port),
+    Scan(Address),
     Term,
 }
 
@@ -105,7 +110,6 @@ struct WorkerMessage {
 
 enum Message {
     Scan(Port, PortState),
-    Error,
 }
 
 struct Worker {
@@ -179,17 +183,8 @@ The channel has been probably closed by the scanner too early.",
     }
     fn run(&self) {
         loop {
-            let mut host = None;
             match self.work_rx.recv().unwrap_or(Instruction::Term) {
-                Instruction::Host(h) => host = Some(h),
-                Instruction::Port(port) => {
-                    let host = match host {
-                        Some(host) => host,
-                        None => {
-                            self.send_message(Message::Error);
-                            break;
-                        }
-                    };
+                Instruction::Scan((host, port)) => {
                     let scan = match port.protocol {
                         Protocol::Tcp => self.tcp(host, port.number),
                         Protocol::Udp => self.udp(host, port.number),
@@ -213,6 +208,8 @@ pub enum Input {
     Stop,
     Cont,
     End,
+    TcpRange(String, u16, u16),
+    UdpRange(String, u16, u16),
     Threads(usize),
 }
 
@@ -224,7 +221,7 @@ struct ScanMaster {
     workers: Vec<WorkerHandle>,
     message_rx: Receiver<WorkerMessage>,
     message_tx: Sender<WorkerMessage>,
-    ranges: PortIter,
+    ranges: AddressIter,
     config: ScannerConfig,
     state: ScannerState,
     input_rx: Receiver<Input>,
@@ -238,7 +235,7 @@ impl ScanMaster {
         let (input_tx, input_rx) = crossbeam::channel::unbounded();
         let (output_tx, output_rx) = crossbeam::channel::unbounded();
         let workers = vec![];
-        let ranges = PortIter::new(vec![]);
+        let ranges = AddressIter::new(vec![]);
         let scanner = ScanMaster {
             workers,
             message_rx,
@@ -254,11 +251,6 @@ impl ScanMaster {
     }
     fn send_output(&self, output: Output) {
         let _ = self.output_tx.send(output);
-    }
-    fn host(&mut self, host: String) {
-        for wh in self.workers.iter_mut() {
-            wh.send_instruction(Instruction::Host(host.clone()));
-        }
     }
     fn try_close(&mut self, count: usize) {
         let mut count = count;
@@ -279,9 +271,11 @@ impl ScanMaster {
             .filter(|wh| !wh.is_term())
             .collect::<Vec<_>>();
     }
-    fn try_terminate(&mut self) -> bool {
+    fn try_terminate(&mut self) {
         self.try_close(self.workers.len());
-        self.workers.len() == 0
+        if self.workers.len() == 0 {
+            self.state = ScannerState::Terminated;
+        }
     }
     fn handle_message(&mut self, message: WorkerMessage) {
         match message.content {
@@ -296,12 +290,39 @@ impl ScanMaster {
                     self.try_terminate();
                 }
             }
-            Message::Error => panic!("server assigned jobs before setting a Host"),
         }
     }
     fn handle_input(&mut self, input: Input) {
+        if self.state == ScannerState::Ending || self.state == ScannerState::Terminated {
+            return;
+        }
         match input {
-            Input::End => self.state = ScannerState::Ending,
+            Input::End => {
+                self.state = ScannerState::Ending;
+                self.try_terminate();
+            }
+            Input::TcpRange(host, from, to) => {
+                self.ranges.ranges.push(AddressRange {
+                    host,
+                    protocol: Protocol::Tcp,
+                    from,
+                    to,
+                });
+                if self.state == ScannerState::Running {
+                    self.assign_work();
+                }
+            }
+            Input::UdpRange(host, from, to) => {
+                self.ranges.ranges.push(AddressRange {
+                    host,
+                    protocol: Protocol::Udp,
+                    from,
+                    to,
+                });
+                if self.state == ScannerState::Running {
+                    self.assign_work();
+                }
+            }
             Input::Stop => {
                 if self.state == ScannerState::Running {
                     self.state = ScannerState::Stop;
@@ -327,7 +348,7 @@ impl ScanMaster {
         let handle = WorkerHandle {
             id: self.id_counter,
             work_tx,
-            state: WorkerState::Working,
+            state: WorkerState::Idle,
             join_handle: Some(std::thread::spawn(move || {
                 let worker = Worker {
                     id,
@@ -352,8 +373,8 @@ impl ScanMaster {
         let mut ranges = std::mem::take(&mut self.ranges);
         for wh in self.workers.iter_mut() {
             if wh.is_idle() {
-                if let Some(port) = ranges.next() {
-                    wh.send_instruction(Instruction::Port(port));
+                if let Some(address) = ranges.next() {
+                    wh.send_instruction(Instruction::Scan(address));
                     wh.state = WorkerState::Working;
                 }
             }
