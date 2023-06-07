@@ -317,12 +317,9 @@ impl Scanner {
         let mut ranges = std::mem::take(&mut self.ranges);
         for wh in self.workers.iter_mut() {
             if wh.is_idle() {
-                match ranges.next() {
-                    Some(port) => {
-                        wh.send_instruction(Instruction::Port(port));
-                        wh.state = WorkerState::Working;
-                    }
-                    None => todo!(),
+                if let Some(port) = ranges.next() {
+                    wh.send_instruction(Instruction::Port(port));
+                    wh.state = WorkerState::Working;
                 }
             }
         }
