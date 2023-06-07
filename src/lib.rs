@@ -40,18 +40,12 @@ pub enum PortState {
 #[derive(Default)]
 pub struct ScannerConfig {
     thread_count: usize,
-    input_rx: Option<Receiver<Input>>,
 }
 
 impl ScannerConfig {
     pub fn thread_count(self, thread_count: usize) -> ScannerConfig {
         let mut s = self;
         s.thread_count = thread_count;
-        s
-    }
-    pub fn input_rx(self, input_rx: Receiver<Input>) -> ScannerConfig {
-        let mut s = self;
-        s.input_rx = Some(input_rx);
         s
     }
 }
@@ -129,6 +123,9 @@ impl WorkerHandle {
     }
     fn is_working(&self) -> bool {
         self.state == WorkerState::Working
+    }
+    fn is_term(&self) -> bool {
+        self.state == WorkerState::Term
     }
     fn join(&mut self) {
         if let Some(h) = self.join_handle.take() {
@@ -212,83 +209,84 @@ pub enum Input {
     Stop,
     Cont,
     End,
+    Threads(usize),
 }
 
+pub enum Output {
+    Term,
+    Scan(Port, PortState),
+}
 struct Scanner {
     workers: Vec<WorkerHandle>,
     message_rx: Receiver<WorkerMessage>,
-    input_rx: Receiver<Input>,
+    message_tx: Sender<WorkerMessage>,
     ranges: PortIter,
     config: ScannerConfig,
     state: ScannerState,
-    output: Vec<(Port, PortState)>,
+    input_rx: Receiver<Input>,
+    output_tx: Sender<Output>,
+    id_counter: usize,
 }
 
 impl Scanner {
-    fn new(ranges: Vec<PortRange>, config: ScannerConfig) -> Scanner {
+    fn new() -> (Scanner, Receiver<Output>, Sender<Input>) {
         let (message_tx, message_rx) = crossbeam::channel::unbounded();
-        let input_rx = config
-            .input_rx
-            .clone()
-            .unwrap_or(crossbeam::channel::never());
-        let worker_count = config.thread_count as usize;
-        let workers = (0..worker_count)
-            .map(|id| {
-                let (work_tx, work_rx) = crossbeam::channel::bounded(1);
-                let message_tx = message_tx.clone();
-                WorkerHandle {
-                    id,
-                    work_tx,
-                    state: WorkerState::Working,
-                    join_handle: Some(std::thread::spawn(move || {
-                        let worker = Worker {
-                            id,
-                            work_rx,
-                            message_tx,
-                        };
-                        worker.run();
-                    })),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let ranges = PortIter::new(ranges);
-
-        Scanner {
+        let (input_tx, input_rx) = crossbeam::channel::unbounded();
+        let (output_tx, output_rx) = crossbeam::channel::unbounded();
+        let workers = vec![];
+        let ranges = PortIter::new(vec![]);
+        let scanner = Scanner {
             workers,
-            input_rx,
             message_rx,
+            message_tx,
             ranges,
-            config,
+            config: ScannerConfig::default(),
             state: ScannerState::Running,
-            output: vec![],
-        }
+            output_tx,
+            input_rx,
+            id_counter: 0,
+        };
+        (scanner, output_rx, input_tx)
+    }
+    fn send_output(&self, output: Output) {
+        let _ = self.output_tx.send(output);
     }
     fn host(&mut self, host: String) {
         for wh in self.workers.iter_mut() {
             wh.send_instruction(Instruction::Host(host.clone()));
         }
     }
-    fn try_terminate(&mut self) -> bool {
-        let mut success = true;
+    fn try_close(&mut self, count: usize) {
+        let mut count = count;
         for wh in self.workers.iter_mut() {
+            if count == 0 {
+                break;
+            }
             if wh.is_idle() {
                 wh.state = WorkerState::Term;
                 wh.send_instruction(Instruction::Term);
                 wh.join();
-            } else if wh.is_working() {
-                success = false;
+                count -= 1;
             }
         }
-        return success;
+        self.workers = self
+            .workers
+            .drain(..)
+            .filter(|wh| !wh.is_term())
+            .collect::<Vec<_>>();
+    }
+    fn try_terminate(&mut self) -> bool {
+        self.try_close(self.workers.len());
+        self.workers.len() == 0
     }
     fn handle_message(&mut self, message: WorkerMessage) {
         match message.content {
             Message::Scan(port, state) => {
                 let worker_id = message.worker_id;
                 self.workers[worker_id].state = WorkerState::Idle;
-                self.output.push((port, state));
+                self.send_output(Output::Scan(port, state));
                 if self.state == ScannerState::Running {
+                    self.thread_count_control();
                     self.assign_work();
                 } else if self.state == ScannerState::Ending {
                     self.try_terminate();
@@ -311,6 +309,39 @@ impl Scanner {
                 }
                 self.assign_work()
             }
+            Input::Threads(count) => {
+                self.config.thread_count = count;
+                self.thread_count_control();
+            }
+        }
+    }
+    fn spawn(&mut self) {
+        self.id_counter += 1;
+        let id = self.id_counter;
+        let (work_tx, work_rx) = crossbeam::channel::bounded(1);
+        let message_tx = self.message_tx.clone();
+        let handle = WorkerHandle {
+            id: self.id_counter,
+            work_tx,
+            state: WorkerState::Working,
+            join_handle: Some(std::thread::spawn(move || {
+                let worker = Worker {
+                    id,
+                    work_rx,
+                    message_tx,
+                };
+                worker.run();
+            })),
+        };
+        self.workers.push(handle);
+    }
+    fn thread_count_control(&mut self) {
+        if self.config.thread_count > self.workers.len() {
+            let diff = self.config.thread_count - self.workers.len();
+            for _ in 0..diff {
+                self.spawn();
+            }
+        } else if self.config.thread_count < self.workers.len() {
         }
     }
     fn assign_work(&mut self) {
@@ -346,9 +377,8 @@ impl Scanner {
     }
 }
 
-pub fn scan(host: String, ranges: Vec<PortRange>, config: ScannerConfig) -> Vec<(Port, PortState)> {
-    let mut scanner = Scanner::new(ranges, config);
-    scanner.host(host);
+pub fn scan() -> Vec<(Port, PortState)> {
+    let (mut scanner, _, _) = Scanner::new();
     let ouput = scanner.listen();
     ouput
 }
