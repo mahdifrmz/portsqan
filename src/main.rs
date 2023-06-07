@@ -1,5 +1,5 @@
-use portsqan::Scanner;
+use portsqan::{scan, ScannerConfig};
 
 fn main() {
-    Scanner::new().scan(vec![]);
+    scan("".to_owned(), vec![], ScannerConfig::default());
 }
