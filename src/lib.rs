@@ -98,6 +98,10 @@ impl ScanQueue {
     fn len(&self) -> usize {
         self.ranges.len()
     }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+    }
 }
 
 type Host = String;
@@ -186,7 +190,7 @@ The channel has been probably closed by the scanner too early.",
         Some(true)
     }
     fn udp(&self, host: String, number: u16) -> Option<bool> {
-        todo!()
+        Some(true)
     }
     fn run(&self) {
         loop {
@@ -219,6 +223,7 @@ pub enum Input {
     UdpRange(String, u16, u16),
     Threads(usize),
     Stale(bool),
+    Cancel,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -349,6 +354,10 @@ impl<O: Fn(Output) + Copy> ScanMaster<O> {
                 self.state = ScannerState::Ending;
                 self.stale_all();
                 self.try_terminate();
+            }
+            Input::Cancel => {
+                self.stale_all();
+                self.ranges.clear();
             }
             Input::Stale(stale) => {
                 self.config.stale = stale;
