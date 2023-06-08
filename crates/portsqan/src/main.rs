@@ -68,7 +68,8 @@ fn main() {
         terminal.lock().unwrap().state = TerminalState::Repl;
         scanner.command(Input::Stop);
         let exit = loop {
-            match rl.readline("> ") {
+            let prompt = format!("{}> ", state.host.clone().unwrap_or("".to_owned()));
+            match rl.readline(prompt.as_str()) {
                 Ok(line) => {
                     let _ = rl.add_history_entry(&line);
                     if line.trim().len() > 0 {
@@ -77,6 +78,7 @@ fn main() {
                         match rsl {
                             Ok(input) => {
                                 match input {
+                                    Input::NOP => {}
                                     Input::Cont => break false,
                                     Input::End => break true,
                                     Input::Cancel => {

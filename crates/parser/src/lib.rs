@@ -127,13 +127,15 @@ impl Parser {
             Input::UdpRange(host, from as u16, to as u16)
         })
     }
-    pub fn parse(&mut self, state: ReplState, text: String) -> (Result<Input, Error>, ReplState) {
-        self.state = state;
-        let mut fields = text.split(' ').map(|s| s.to_owned()).collect::<Vec<_>>();
-        let rsl = if let Some(name) = fields.first().cloned() {
-            fields.remove(0);
-            self.fields = fields;
+    pub fn parse_fields(&mut self) -> Result<Input, Error> {
+        if let Some(name) = self.fields.first().cloned() {
+            self.fields.remove(0);
             match name.as_str() {
+                "host" | "h" => {
+                    self.state.host = Some(self.parse_string()?);
+                    Ok(Input::NOP)
+                }
+                "ping" | "p" => Ok(Input::Ping),
                 "quit" | "q" | "exit" => Ok(Input::End),
                 "cancel" | "c" => Ok(Input::Cancel),
                 "resume" | "r" => Ok(Input::Cont),
@@ -143,7 +145,12 @@ impl Parser {
             }
         } else {
             Err(Error::Empty)
-        };
+        }
+    }
+    pub fn parse(&mut self, state: ReplState, text: String) -> (Result<Input, Error>, ReplState) {
+        self.state = state;
+        self.fields = text.split(' ').map(|s| s.to_owned()).collect::<Vec<_>>();
+        let rsl = self.parse_fields();
         self.pointer = 0;
         self.buffer = None;
         (rsl, std::mem::take(&mut self.state))

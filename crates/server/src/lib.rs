@@ -228,6 +228,8 @@ pub enum Input {
     Threads(usize),
     Stale(bool),
     Cancel,
+    NOP,
+    Ping,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -364,6 +366,7 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
                 self.stale_all();
                 self.try_terminate();
             }
+            Input::Ping => {}
             Input::Cancel => {
                 self.stale_all();
                 self.ranges.clear();
@@ -404,6 +407,7 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
                 self.config.thread_count = count;
                 self.thread_count_control();
             }
+            Input::NOP => {}
         }
         self.send_sync_output(Output::Ok);
     }
