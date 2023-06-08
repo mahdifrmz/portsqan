@@ -37,7 +37,7 @@ pub struct Port {
     number: u16,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum PortState {
     Open,
     Closed,
@@ -136,9 +136,6 @@ impl WorkerHandle {
     fn is_idle(&self) -> bool {
         self.state == WorkerState::Idle
     }
-    fn is_working(&self) -> bool {
-        self.state == WorkerState::Working
-    }
     fn is_term(&self) -> bool {
         self.state == WorkerState::Term
     }
@@ -222,14 +219,14 @@ pub enum Input {
     Threads(usize),
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Output {
     Term,
     TcpScan(String, u16, PortState),
     UdpScan(String, u16, PortState),
     Idle,
 }
-struct ScanMaster {
+struct ScanMaster<O: Fn(Output) + Copy> {
     workers: Vec<WorkerHandle>,
     message_rx: Receiver<WorkerMessage>,
     message_tx: Sender<WorkerMessage>,
@@ -237,15 +234,14 @@ struct ScanMaster {
     config: ScannerConfig,
     state: ScannerState,
     input_rx: Receiver<Input>,
-    output_tx: Sender<Output>,
+    output: O,
     id_counter: usize,
 }
 
-impl ScanMaster {
-    fn new() -> (ScanMaster, Receiver<Output>, Sender<Input>) {
+impl<O: Fn(Output) + Copy> ScanMaster<O> {
+    fn new(output: O) -> (ScanMaster<O>, Sender<Input>) {
         let (message_tx, message_rx) = crossbeam::channel::unbounded();
         let (input_tx, input_rx) = crossbeam::channel::unbounded();
-        let (output_tx, output_rx) = crossbeam::channel::unbounded();
         let workers = vec![];
         let ranges = ScanQueue::new();
         let scanner = ScanMaster {
@@ -255,14 +251,15 @@ impl ScanMaster {
             ranges,
             config: ScannerConfig::default(),
             state: ScannerState::Running,
-            output_tx,
             input_rx,
+            output,
             id_counter: 0,
         };
-        (scanner, output_rx, input_tx)
+        (scanner, input_tx)
     }
     fn send_output(&self, output: Output) {
-        let _ = self.output_tx.send(output);
+        let out_fn = self.output;
+        out_fn(output);
     }
     fn threads_clean(&mut self) {
         self.workers = self
@@ -439,43 +436,22 @@ impl ScanMaster {
 #[derive(Clone)]
 pub struct Scanner {
     tx: Sender<Input>,
-    rx: Receiver<Output>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Scanner {
-    pub fn new() -> Scanner {
-        let (mut scan_master, rx, tx) = ScanMaster::new();
+    pub fn new<O: Fn(Output) + Copy + Send + 'static>(output: O) -> Scanner {
+        let (mut scan_master, tx) = ScanMaster::new(output);
         let handle = std::thread::spawn(move || {
             scan_master.listen();
         });
         let handle = Arc::new(Mutex::new(Some(handle)));
-        Scanner { rx, tx, handle }
+        Scanner { tx, handle }
     }
-
-    pub fn read(&self) -> Option<Output> {
-        self.rx.recv().ok()
-    }
-    pub fn write(&self, input: Input) -> Option<()> {
+    pub fn command(&self, input: Input) -> Option<()> {
         self.tx.send(input).ok()
     }
-    fn join(&self) -> Option<()> {
+    pub fn join(&self) -> Option<()> {
         self.handle.lock().ok()?.take()?.join().ok()
-    }
-    fn wait_for_output(&self, output: Output) -> Option<()> {
-        let mut o = self.read()?;
-        while o != output {
-            o = self.read()?;
-        }
-        Some(())
-    }
-    pub fn terminate(&self) -> Option<()> {
-        self.write(Input::End)?;
-        self.join()
-    }
-
-    pub fn wait(&self) -> Option<()> {
-        self.wait_for_output(Output::Idle);
-        self.terminate()
     }
 }
