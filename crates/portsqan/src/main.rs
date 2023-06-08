@@ -3,8 +3,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use portsqan::{Input, Output, Scanner};
 use rustyline::{error::ReadlineError, DefaultEditor};
+use server::{Input, Output, Scanner};
 
 enum TerminalState {
     Log,

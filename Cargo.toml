@@ -2,5 +2,6 @@
 
 members = [
     'crates/server',
-    'crates/parser'
+    'crates/parser',
+    'crates/portsqan'
 ]
