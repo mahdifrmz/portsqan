@@ -47,6 +47,7 @@ pub enum PortState {
 #[derive(Default)]
 pub struct ScannerConfig {
     thread_count: usize,
+    stale: bool,
 }
 
 impl ScannerConfig {
@@ -126,6 +127,7 @@ struct Worker {
 }
 
 struct WorkerHandle {
+    stale: bool,
     id: WorkerId,
     state: WorkerState,
     work_tx: Sender<Instruction>,
@@ -217,6 +219,7 @@ pub enum Input {
     TcpRange(String, u16, u16),
     UdpRange(String, u16, u16),
     Threads(usize),
+    Stale(bool),
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -309,10 +312,19 @@ impl<O: Fn(Output) + Copy> ScanMaster<O> {
                     .workers
                     .binary_search_by_key(&worker_id, |wh| wh.id)
                     .unwrap();
-                self.workers[worker_idx].state = WorkerState::Idle;
-                match port.protocol {
-                    Protocol::Tcp => self.send_output(Output::TcpScan(host, port.number, state)),
-                    Protocol::Udp => self.send_output(Output::UdpScan(host, port.number, state)),
+                let worker = &mut self.workers[worker_idx];
+                worker.state = WorkerState::Idle;
+                let stale = worker.stale;
+                worker.stale = false;
+                if !stale || !self.config.stale {
+                    match port.protocol {
+                        Protocol::Tcp => {
+                            self.send_output(Output::TcpScan(host, port.number, state))
+                        }
+                        Protocol::Udp => {
+                            self.send_output(Output::UdpScan(host, port.number, state))
+                        }
+                    }
                 }
                 if self.state == ScannerState::Running {
                     self.thread_count_control();
@@ -332,6 +344,9 @@ impl<O: Fn(Output) + Copy> ScanMaster<O> {
             Input::End => {
                 self.state = ScannerState::Ending;
                 self.try_terminate();
+            }
+            Input::Stale(stale) => {
+                self.config.stale = stale;
             }
             Input::TcpRange(host, from, to) => {
                 self.ranges.push(AddressRange {
@@ -385,6 +400,7 @@ impl<O: Fn(Output) + Copy> ScanMaster<O> {
                 };
                 worker.run();
             })),
+            stale: false,
         };
         self.workers.push(handle);
     }
