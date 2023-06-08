@@ -88,6 +88,7 @@ impl ScanQueue {
                 Some(address)
             } else {
                 self.ranges.remove(0);
+                self.address_index = 0;
                 self.pop()
             }
         } else {
@@ -103,6 +104,7 @@ impl ScanQueue {
 
     fn clear(&mut self) {
         self.ranges.clear();
+        self.address_index = 0;
     }
 }
 
@@ -216,6 +218,7 @@ The channel has been probably closed by the scanner too early.",
     }
 }
 
+#[derive(Debug)]
 pub enum Input {
     Stop,
     Cont,
@@ -229,10 +232,12 @@ pub enum Input {
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum Output {
-    Term,
+    // async
     TcpScan(String, u16, PortState),
     UdpScan(String, u16, PortState),
     Idle,
+    // sync
+    Ok,
 }
 struct ScanMaster<O: Fn(Output) + Clone> {
     workers: Vec<WorkerHandle>,
@@ -242,17 +247,17 @@ struct ScanMaster<O: Fn(Output) + Clone> {
     config: ScannerConfig,
     state: ScannerState,
     input_rx: Receiver<Input>,
+    output_tx: Sender<Output>,
     output: O,
     id_counter: usize,
 }
 
 impl<O: Fn(Output) + Clone> ScanMaster<O> {
-    fn new(output: O) -> (ScanMaster<O>, Sender<Input>) {
+    fn new(output: O, input_rx: Receiver<Input>, output_tx: Sender<Output>) -> ScanMaster<O> {
         let (message_tx, message_rx) = crossbeam::channel::unbounded();
-        let (input_tx, input_rx) = crossbeam::channel::unbounded();
         let workers = vec![];
         let ranges = ScanQueue::new();
-        let scanner = ScanMaster {
+        ScanMaster {
             workers,
             message_rx,
             message_tx,
@@ -261,13 +266,16 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
             state: ScannerState::Running,
             input_rx,
             output,
+            output_tx,
             id_counter: 0,
-        };
-        (scanner, input_tx)
+        }
     }
-    fn send_output(&self, output: Output) {
+    fn send_async_output(&self, output: Output) {
         let out_fn = self.output.clone();
         out_fn(output);
+    }
+    fn send_sync_output(&self, output: Output) {
+        let _ = self.output_tx.send(output);
     }
     fn threads_clean(&mut self) {
         self.workers = self
@@ -324,10 +332,10 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
                 if !stale || !self.config.stale {
                     match port.protocol {
                         Protocol::Tcp => {
-                            self.send_output(Output::TcpScan(host, port.number, state))
+                            self.send_async_output(Output::TcpScan(host, port.number, state))
                         }
                         Protocol::Udp => {
-                            self.send_output(Output::UdpScan(host, port.number, state))
+                            self.send_async_output(Output::UdpScan(host, port.number, state))
                         }
                     }
                 }
@@ -390,13 +398,14 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
                 if self.state == ScannerState::Stop {
                     self.state = ScannerState::Running;
                 }
-                self.assign_work()
+                self.assign_work();
             }
             Input::Threads(count) => {
                 self.config.thread_count = count;
                 self.thread_count_control();
             }
         }
+        self.send_sync_output(Output::Ok);
     }
     fn spawn(&mut self) {
         self.id_counter += 1;
@@ -441,7 +450,7 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
             && self.state == ScannerState::Running
             && self.ranges.len() == 0
         {
-            self.send_output(Output::Idle)
+            self.send_async_output(Output::Idle)
         }
     }
     fn drop_input_channel(&mut self) {
@@ -467,20 +476,28 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
 #[derive(Clone)]
 pub struct Scanner {
     tx: Sender<Input>,
+    rx: Receiver<Output>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Scanner {
     pub fn new<O: Fn(Output) + Send + Clone + 'static>(output: O) -> Scanner {
-        let (mut scan_master, tx) = ScanMaster::new(output);
+        let (input_tx, input_rx) = crossbeam::channel::unbounded();
+        let (output_tx, output_rx) = crossbeam::channel::unbounded();
+        let mut scan_master = ScanMaster::new(output, input_rx, output_tx);
         let handle = std::thread::spawn(move || {
             scan_master.listen();
         });
         let handle = Arc::new(Mutex::new(Some(handle)));
-        Scanner { tx, handle }
+        Scanner {
+            tx: input_tx,
+            rx: output_rx,
+            handle,
+        }
     }
-    pub fn command(&self, input: Input) -> Option<()> {
-        self.tx.send(input).ok()
+    pub fn command(&self, input: Input) -> Option<Output> {
+        self.tx.send(input).ok()?;
+        self.rx.recv().ok()
     }
     pub fn join(&self) -> Option<()> {
         self.handle.lock().ok()?.take()?.join().ok()

@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use parser::{Parser, ReplState};
 use rustyline::{error::ReadlineError, DefaultEditor};
 use server::{Input, Output, Scanner};
 
@@ -24,9 +25,21 @@ impl Default for Terminal {
         }
     }
 }
+impl Terminal {
+    fn clear_scan_results(&mut self) {
+        self.buffered_output = self
+            .buffered_output
+            .drain(..)
+            .filter(|s| match s {
+                Output::TcpScan(_, _, _) | Output::UdpScan(_, _, _) => false,
+                _ => true,
+            })
+            .collect::<Vec<_>>()
+    }
+}
 
 fn print_scanner_output(output: Output) {
-    println!("-> {:?}", output)
+    println!("| {:?}", output)
 }
 
 fn main() {
@@ -47,19 +60,40 @@ fn main() {
         }
     });
     scanner.command(Input::Threads(1));
-    scanner.command(Input::UdpRange("127.0.0.1".to_owned(), 1, 1024));
+    let mut state = ReplState { host: None };
+    let mut parser = Parser::default();
+    let mut rl = DefaultEditor::new().unwrap();
     loop {
         int_rx.recv().unwrap();
         terminal.lock().unwrap().state = TerminalState::Repl;
         scanner.command(Input::Stop);
-        let mut rl = DefaultEditor::new().unwrap();
         let exit = loop {
             match rl.readline("> ") {
                 Ok(line) => {
-                    if line.as_str() == "q" {
-                        break true;
-                    } else {
-                        println!("ECHO: '{}'", line);
+                    let _ = rl.add_history_entry(&line);
+                    if line.trim().len() > 0 {
+                        let (rsl, new_state) = parser.parse(state, line);
+                        state = new_state;
+                        match rsl {
+                            Ok(input) => {
+                                match input {
+                                    Input::Cont => break false,
+                                    Input::End => break true,
+                                    Input::Cancel => {
+                                        terminal.lock().unwrap().clear_scan_results();
+                                        if let Some(output) = scanner.command(input) {
+                                            print_scanner_output(output)
+                                        }
+                                    }
+                                    _ => {
+                                        if let Some(output) = scanner.command(input) {
+                                            print_scanner_output(output)
+                                        }
+                                    }
+                                };
+                            }
+                            Err(err) => eprintln!("Error: {:?}", err),
+                        }
                     }
                 }
                 Err(ReadlineError::Eof) => break false,

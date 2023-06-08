@@ -1,5 +1,6 @@
 use server::Input;
 
+#[derive(Default)]
 pub struct Parser {
     state: ReplState,
     fields: Vec<String>,
@@ -7,7 +8,7 @@ pub struct Parser {
     buffer: Option<Token>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Token {
     Int(usize),
     String(String),
@@ -18,15 +19,17 @@ enum Token {
     EOF,
 }
 
+#[derive(Debug)]
 pub enum Error {
     Empty,
-    UnknowCommand,
+    UnknownCommand,
     UnexpectedEnd,
     InvalidParam(usize),
     HostNotSpecified,
     InvalidPort(usize),
 }
 
+#[derive(Default)]
 pub struct ReplState {
     pub host: Option<String>,
 }
@@ -128,23 +131,25 @@ impl Parser {
             Input::UdpRange(host, from as u16, to as u16)
         })
     }
-    pub fn parse(&mut self, state: ReplState, command: String) -> Result<Input, Error> {
+    pub fn parse(&mut self, state: ReplState, text: String) -> (Result<Input, Error>, ReplState) {
         self.state = state;
-        let mut command = command.split(' ').map(|s| s.to_owned()).collect::<Vec<_>>();
-        if let Some(name) = command.first().cloned() {
-            command.remove(0);
-            self.fields = command;
-            let output = match name.as_str() {
-                "quit" | "q" | "exit" => Input::End,
-                "cancel" | "c" => Input::Cancel,
-                "resume" | "r" => Input::Cont,
-                "config" | "conf" | "cfg" => self.parse_config()?,
-                "scan" | "s" => self.parse_scan()?,
-                _ => return Err(Error::UnknowCommand),
-            };
-            Ok(output)
+        let mut fields = text.split(' ').map(|s| s.to_owned()).collect::<Vec<_>>();
+        let rsl = if let Some(name) = fields.first().cloned() {
+            fields.remove(0);
+            self.fields = fields;
+            match name.as_str() {
+                "quit" | "q" | "exit" => Ok(Input::End),
+                "cancel" | "c" => Ok(Input::Cancel),
+                "resume" | "r" => Ok(Input::Cont),
+                "config" | "conf" | "cfg" => self.parse_config(),
+                "scan" | "s" => self.parse_scan(),
+                _ => Err(Error::UnknownCommand),
+            }
         } else {
             Err(Error::Empty)
-        }
+        };
+        self.pointer = 0;
+        self.buffer = None;
+        (rsl, std::mem::take(&mut self.state))
     }
 }
