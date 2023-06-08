@@ -1,3 +1,5 @@
+mod net;
+
 use std::{
     sync::{Arc, Mutex},
     thread::JoinHandle,
@@ -186,11 +188,10 @@ The channel has been probably closed by the scanner too early.",
             );
     }
     fn tcp(&self, host: String, number: u16) -> Option<bool> {
-        std::thread::sleep(Duration::from_secs(1));
-        Some(true)
+        net::scan_tcp(host, number)
     }
     fn udp(&self, host: String, number: u16) -> Option<bool> {
-        Some(true)
+        net::scan_udp(host, number, Duration::from_secs(1))
     }
     fn run(&self) {
         loop {
