@@ -182,7 +182,6 @@ The channel has been probably closed by the scanner too early.",
             );
     }
     fn tcp(&self, host: String, number: u16) -> Option<bool> {
-        println!("{}:{}", host, number);
         std::thread::sleep(Duration::from_secs(1));
         Some(true)
     }
@@ -336,6 +335,11 @@ impl<O: Fn(Output) + Copy> ScanMaster<O> {
             }
         }
     }
+    fn stale_all(&mut self) {
+        for wh in self.workers.iter_mut() {
+            wh.stale = true;
+        }
+    }
     fn handle_input(&mut self, input: Input) {
         if self.state == ScannerState::Ending || self.state == ScannerState::Terminated {
             return;
@@ -343,6 +347,7 @@ impl<O: Fn(Output) + Copy> ScanMaster<O> {
         match input {
             Input::End => {
                 self.state = ScannerState::Ending;
+                self.stale_all();
                 self.try_terminate();
             }
             Input::Stale(stale) => {
