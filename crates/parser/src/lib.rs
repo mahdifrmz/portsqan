@@ -86,16 +86,12 @@ impl Parser {
         }
     }
     fn parse_config(&mut self) -> Result<Input, Error> {
-        let key = self.next();
-        if let Token::String(key) = key {
-            match key.as_str() {
-                "threads" | "thread" | "t" => Ok(Input::Threads(self.parse_number()?)),
-                _ => Err(Error::InvalidParam(self.pointer)),
-            }
-        } else {
-            Err(Error::InvalidParam(self.pointer))
+        match self.parse_string()?.as_str() {
+            "threads" | "thread" | "t" => Ok(Input::Threads(self.parse_number()?)),
+            _ => Err(Error::InvalidParam(self.pointer)),
         }
     }
+
     fn parse_scan(&mut self) -> Result<Input, Error> {
         let host = if let Token::String(name) = self.peek() {
             let name = name;
