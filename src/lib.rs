@@ -234,7 +234,7 @@ pub enum Output {
     UdpScan(String, u16, PortState),
     Idle,
 }
-struct ScanMaster<O: Fn(Output) + Copy> {
+struct ScanMaster<O: Fn(Output) + Clone> {
     workers: Vec<WorkerHandle>,
     message_rx: Receiver<WorkerMessage>,
     message_tx: Sender<WorkerMessage>,
@@ -246,7 +246,7 @@ struct ScanMaster<O: Fn(Output) + Copy> {
     id_counter: usize,
 }
 
-impl<O: Fn(Output) + Copy> ScanMaster<O> {
+impl<O: Fn(Output) + Clone> ScanMaster<O> {
     fn new(output: O) -> (ScanMaster<O>, Sender<Input>) {
         let (message_tx, message_rx) = crossbeam::channel::unbounded();
         let (input_tx, input_rx) = crossbeam::channel::unbounded();
@@ -266,7 +266,7 @@ impl<O: Fn(Output) + Copy> ScanMaster<O> {
         (scanner, input_tx)
     }
     fn send_output(&self, output: Output) {
-        let out_fn = self.output;
+        let out_fn = self.output.clone();
         out_fn(output);
     }
     fn threads_clean(&mut self) {
@@ -471,7 +471,7 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    pub fn new<O: Fn(Output) + Copy + Send + 'static>(output: O) -> Scanner {
+    pub fn new<O: Fn(Output) + Send + Clone + 'static>(output: O) -> Scanner {
         let (mut scan_master, tx) = ScanMaster::new(output);
         let handle = std::thread::spawn(move || {
             scan_master.listen();

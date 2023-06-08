@@ -7,3 +7,5 @@ edition = "2021"
 
 [dependencies]
 crossbeam = "0.8.2"
+ctrlc = "3.4.0"
+rustyline = "11.0.0"
