@@ -3,5 +3,6 @@
 members = [
     'crates/server',
     'crates/parser',
-    'crates/portsqan'
+    'crates/portsqan',
+    'crates/libportsqan'
 ]
