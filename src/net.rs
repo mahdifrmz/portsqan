@@ -16,7 +16,7 @@ pub fn scan_tcp(host: String, number: u16) -> Option<bool> {
 pub fn scan_udp(host: String, number: u16, timeout: Duration) -> Option<bool> {
     let address = format!("{}:{}", host, number);
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    if let Err(e) = socket.send_to(&[], address) {
+    if socket.send_to(&[], address).is_err() {
         return None;
     }
     let mut buffer = [];
