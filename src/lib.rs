@@ -1,6 +1,7 @@
 use std::{
     sync::{Arc, Mutex},
     thread::JoinHandle,
+    time::Duration,
     vec,
 };
 
@@ -36,6 +37,7 @@ pub struct Port {
     number: u16,
 }
 
+#[derive(PartialEq, Eq)]
 pub enum PortState {
     Open,
     Closed,
@@ -56,39 +58,44 @@ impl ScannerConfig {
 }
 
 #[derive(Default)]
-struct AddressIter {
-    range_index: usize,
-    port_index: usize,
+struct ScanQueue {
+    address_index: usize,
     ranges: Vec<AddressRange>,
 }
 
-impl AddressIter {
-    fn new(ranges: Vec<AddressRange>) -> AddressIter {
-        AddressIter {
-            range_index: 0,
-            port_index: 0,
-            ranges,
+impl ScanQueue {
+    fn new() -> ScanQueue {
+        ScanQueue {
+            address_index: 0,
+            ranges: vec![],
         }
     }
-    fn next(&mut self) -> Option<Address> {
-        let range = &self.ranges[self.range_index];
-        if self.port_index == range.len() {
-            if self.range_index == self.ranges.len() - 1 {
-                None
+    fn pop(&mut self) -> Option<Address> {
+        if let Some(address_range) = self.ranges.first() {
+            if address_range.len() > self.address_index {
+                let number = address_range.nth(self.address_index);
+                self.address_index += 1;
+                let address = (
+                    address_range.host.clone(),
+                    Port {
+                        protocol: address_range.protocol,
+                        number,
+                    },
+                );
+                Some(address)
             } else {
-                self.port_index = 0;
-                self.range_index += 1;
-                self.next()
+                self.ranges.remove(0);
+                self.pop()
             }
         } else {
-            let port = Port {
-                protocol: range.protocol,
-                number: range.nth(self.port_index),
-            };
-            let host = range.host.clone();
-            self.port_index += 1;
-            Some((host, port))
+            None
         }
+    }
+    fn push(&mut self, address_range: AddressRange) {
+        self.ranges.push(address_range)
+    }
+    fn len(&self) -> usize {
+        self.ranges.len()
     }
 }
 
@@ -109,7 +116,7 @@ struct WorkerMessage {
 }
 
 enum Message {
-    Scan(Port, PortState),
+    Scan(Host, Port, PortState),
 }
 
 struct Worker {
@@ -176,7 +183,9 @@ The channel has been probably closed by the scanner too early.",
             );
     }
     fn tcp(&self, host: String, number: u16) -> Option<bool> {
-        todo!()
+        println!("{}:{}", host, number);
+        std::thread::sleep(Duration::from_secs(1));
+        Some(true)
     }
     fn udp(&self, host: String, number: u16) -> Option<bool> {
         todo!()
@@ -186,15 +195,15 @@ The channel has been probably closed by the scanner too early.",
             match self.work_rx.recv().unwrap_or(Instruction::Term) {
                 Instruction::Scan((host, port)) => {
                     let scan = match port.protocol {
-                        Protocol::Tcp => self.tcp(host, port.number),
-                        Protocol::Udp => self.udp(host, port.number),
+                        Protocol::Tcp => self.tcp(host.clone(), port.number),
+                        Protocol::Udp => self.udp(host.clone(), port.number),
                     };
                     let scan = match scan {
                         Some(true) => PortState::Open,
                         Some(false) => PortState::Closed,
                         None => PortState::Unreachable,
                     };
-                    self.send_message(Message::Scan(port, scan));
+                    self.send_message(Message::Scan(host, port, scan));
                 }
                 Instruction::Term => {
                     break;
@@ -213,15 +222,18 @@ pub enum Input {
     Threads(usize),
 }
 
+#[derive(PartialEq, Eq)]
 pub enum Output {
     Term,
-    Scan(Port, PortState),
+    TcpScan(String, u16, PortState),
+    UdpScan(String, u16, PortState),
+    Idle,
 }
 struct ScanMaster {
     workers: Vec<WorkerHandle>,
     message_rx: Receiver<WorkerMessage>,
     message_tx: Sender<WorkerMessage>,
-    ranges: AddressIter,
+    ranges: ScanQueue,
     config: ScannerConfig,
     state: ScannerState,
     input_rx: Receiver<Input>,
@@ -235,7 +247,7 @@ impl ScanMaster {
         let (input_tx, input_rx) = crossbeam::channel::unbounded();
         let (output_tx, output_rx) = crossbeam::channel::unbounded();
         let workers = vec![];
-        let ranges = AddressIter::new(vec![]);
+        let ranges = ScanQueue::new();
         let scanner = ScanMaster {
             workers,
             message_rx,
@@ -252,6 +264,13 @@ impl ScanMaster {
     fn send_output(&self, output: Output) {
         let _ = self.output_tx.send(output);
     }
+    fn threads_clean(&mut self) {
+        self.workers = self
+            .workers
+            .drain(..)
+            .filter(|wh| !wh.is_term())
+            .collect::<Vec<_>>();
+    }
     fn try_close(&mut self, count: usize) {
         let mut count = count;
         for wh in self.workers.iter_mut() {
@@ -265,11 +284,7 @@ impl ScanMaster {
                 count -= 1;
             }
         }
-        self.workers = self
-            .workers
-            .drain(..)
-            .filter(|wh| !wh.is_term())
-            .collect::<Vec<_>>();
+        self.threads_clean();
     }
     fn try_terminate(&mut self) {
         self.try_close(self.workers.len());
@@ -277,15 +292,35 @@ impl ScanMaster {
             self.state = ScannerState::Terminated;
         }
     }
+    fn thread_count_control(&mut self) {
+        if self.config.thread_count > self.workers.len() {
+            let diff = self.config.thread_count - self.workers.len();
+            for _ in 0..diff {
+                self.spawn();
+            }
+            self.assign_work();
+        } else if self.config.thread_count < self.workers.len() {
+            let diff = self.workers.len() - self.config.thread_count;
+            self.try_close(diff)
+        }
+    }
     fn handle_message(&mut self, message: WorkerMessage) {
         match message.content {
-            Message::Scan(port, state) => {
+            Message::Scan(host, port, state) => {
                 let worker_id = message.worker_id;
-                self.workers[worker_id].state = WorkerState::Idle;
-                self.send_output(Output::Scan(port, state));
+                let worker_idx = self
+                    .workers
+                    .binary_search_by_key(&worker_id, |wh| wh.id)
+                    .unwrap();
+                self.workers[worker_idx].state = WorkerState::Idle;
+                match port.protocol {
+                    Protocol::Tcp => self.send_output(Output::TcpScan(host, port.number, state)),
+                    Protocol::Udp => self.send_output(Output::UdpScan(host, port.number, state)),
+                }
                 if self.state == ScannerState::Running {
                     self.thread_count_control();
                     self.assign_work();
+                    self.check_idle();
                 } else if self.state == ScannerState::Ending {
                     self.try_terminate();
                 }
@@ -302,26 +337,22 @@ impl ScanMaster {
                 self.try_terminate();
             }
             Input::TcpRange(host, from, to) => {
-                self.ranges.ranges.push(AddressRange {
+                self.ranges.push(AddressRange {
                     host,
                     protocol: Protocol::Tcp,
                     from,
                     to,
                 });
-                if self.state == ScannerState::Running {
-                    self.assign_work();
-                }
+                self.assign_work();
             }
             Input::UdpRange(host, from, to) => {
-                self.ranges.ranges.push(AddressRange {
+                self.ranges.push(AddressRange {
                     host,
                     protocol: Protocol::Udp,
                     from,
                     to,
                 });
-                if self.state == ScannerState::Running {
-                    self.assign_work();
-                }
+                self.assign_work();
             }
             Input::Stop => {
                 if self.state == ScannerState::Running {
@@ -360,26 +391,30 @@ impl ScanMaster {
         };
         self.workers.push(handle);
     }
-    fn thread_count_control(&mut self) {
-        if self.config.thread_count > self.workers.len() {
-            let diff = self.config.thread_count - self.workers.len();
-            for _ in 0..diff {
-                self.spawn();
-            }
-        } else if self.config.thread_count < self.workers.len() {
-        }
-    }
     fn assign_work(&mut self) {
+        if self.state != ScannerState::Running {
+            return;
+        }
         let mut ranges = std::mem::take(&mut self.ranges);
         for wh in self.workers.iter_mut() {
             if wh.is_idle() {
-                if let Some(address) = ranges.next() {
+                if let Some(address) = ranges.pop() {
                     wh.send_instruction(Instruction::Scan(address));
                     wh.state = WorkerState::Working;
+                } else {
+                    break;
                 }
             }
         }
         self.ranges = ranges;
+    }
+    fn check_idle(&self) {
+        if self.workers.iter().filter(|wh| wh.is_idle()).count() == self.workers.len()
+            && self.state == ScannerState::Running
+            && self.ranges.len() == 0
+        {
+            self.send_output(Output::Idle)
+        }
     }
     fn drop_input_channel(&mut self) {
         self.input_rx = crossbeam::channel::never();
@@ -424,7 +459,23 @@ impl Scanner {
     pub fn write(&self, input: Input) -> Option<()> {
         self.tx.send(input).ok()
     }
-    pub fn destroy(&self) -> Option<()> {
+    fn join(&self) -> Option<()> {
         self.handle.lock().ok()?.take()?.join().ok()
+    }
+    fn wait_for_output(&self, output: Output) -> Option<()> {
+        let mut o = self.read()?;
+        while o != Output::Idle {
+            o = self.read()?;
+        }
+        Some(())
+    }
+    pub fn terminate(&self) -> Option<()> {
+        self.write(Input::End)?;
+        self.join()
+    }
+
+    pub fn wait(&self) -> Option<()> {
+        self.wait_for_output(Output::Idle);
+        self.terminate()
     }
 }
