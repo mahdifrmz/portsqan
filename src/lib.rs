@@ -464,7 +464,7 @@ impl Scanner {
     }
     fn wait_for_output(&self, output: Output) -> Option<()> {
         let mut o = self.read()?;
-        while o != Output::Idle {
+        while o != output {
             o = self.read()?;
         }
         Some(())
