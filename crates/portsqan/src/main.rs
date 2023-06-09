@@ -3,9 +3,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use libportsqan::ScannerBuilder;
 use parser::{Parser, ReplState};
 use rustyline::{error::ReadlineError, DefaultEditor};
-use server::{Input, Output, Scanner};
+use server::{Input, Output};
 
 enum TerminalState {
     Log,
@@ -42,7 +43,7 @@ fn print_scanner_output(output: Output) {
     println!("| {:?}", output)
 }
 
-fn main() {
+fn run_server(config: ScannerBuilder) {
     let (int_tx, int_rx) = crossbeam::channel::bounded(1);
     let handler = move || {
         int_tx.send(()).unwrap();
@@ -51,7 +52,7 @@ fn main() {
 
     let terminal = Arc::new(Mutex::new(Terminal::default()));
     let tclone = terminal.clone();
-    let scanner = Scanner::new(move |output| {
+    let scanner = config.build(move |output| {
         if let Ok(mut terminal) = tclone.lock() {
             match terminal.state {
                 TerminalState::Log => print_scanner_output(output),
@@ -59,10 +60,10 @@ fn main() {
             }
         }
     });
-    scanner.command(Input::Threads(1));
     let mut state = ReplState { host: None };
     let mut parser = Parser::default();
     let mut rl = DefaultEditor::new().unwrap();
+
     loop {
         int_rx.recv().unwrap();
         terminal.lock().unwrap().state = TerminalState::Repl;
@@ -119,4 +120,15 @@ fn main() {
     }
     scanner.command(Input::End);
     scanner.join();
+}
+
+fn main() {
+    run_server(
+        ScannerBuilder::default()
+            .thread_count(1)
+            .tcp_timeout(500)
+            .udp_timeout(500)
+            .stale(true)
+            .attemps(1),
+    )
 }

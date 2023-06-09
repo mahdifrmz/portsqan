@@ -88,6 +88,9 @@ impl Parser {
     fn parse_config(&mut self) -> Result<Input, Error> {
         match self.parse_string()?.as_str() {
             "threads" | "thread" | "t" => Ok(Input::Threads(self.parse_number()?)),
+            "tries" | "attemps" | "a" => Ok(Input::Attmpts(self.parse_number()?)),
+            "tcp-timeout" | "timeout" | "tto" => Ok(Input::TcpTimeout(self.parse_number()?)),
+            "udp-timeout" | "uto" => Ok(Input::TcpTimeout(self.parse_number()?)),
             _ => Err(Error::InvalidParam(self.pointer)),
         }
     }

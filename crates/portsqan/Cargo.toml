@@ -9,5 +9,7 @@ edition = "2021"
 rustyline = "11.0.0"
 ctrlc = "3.4.0"
 crossbeam = "0.8.2"
+clap = "4.3.3"
 server = { path = '../server'}
 parser = { path = '../parser'}
+libportsqan = { path = '../libportsqan' }

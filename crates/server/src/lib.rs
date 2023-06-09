@@ -1,7 +1,7 @@
 mod net;
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     thread::JoinHandle,
     time::Duration,
     vec,
@@ -46,10 +46,24 @@ pub enum PortState {
     Unreachable,
 }
 
-#[derive(Default)]
 pub struct ScannerConfig {
     thread_count: usize,
     stale: bool,
+    tcp_timeout: usize, // miliseconds
+    udp_timeout: usize, // miliseconds
+    attemps: usize,
+}
+
+impl Default for ScannerConfig {
+    fn default() -> Self {
+        Self {
+            attemps: 1,
+            thread_count: 1,
+            stale: true,
+            tcp_timeout: 500,
+            udp_timeout: 500,
+        }
+    }
 }
 
 impl ScannerConfig {
@@ -132,6 +146,7 @@ struct Worker {
     id: WorkerId,
     work_rx: Receiver<Instruction>,
     message_tx: Sender<WorkerMessage>,
+    config: Arc<Mutex<ScannerConfig>>,
 }
 
 struct WorkerHandle {
@@ -189,11 +204,20 @@ impl Worker {
 The channel has been probably closed by the scanner too early.",
             );
     }
+    fn config(&self) -> MutexGuard<ScannerConfig> {
+        self.config.lock().unwrap()
+    }
     fn tcp(&self, host: String, number: u16) -> Option<bool> {
-        net::scan_tcp(host, number)
+        let config = self.config();
+        let attemps = config.attemps;
+        let timeout = config.tcp_timeout;
+        net::scan_tcp(host, number, Duration::from_millis(timeout as u64), attemps)
     }
     fn udp(&self, host: String, number: u16) -> Option<bool> {
-        net::scan_udp(host, number, Duration::from_secs(1))
+        let config = self.config();
+        let attemps = config.attemps;
+        let timeout = config.tcp_timeout;
+        net::scan_udp(host, number, Duration::from_millis(timeout as u64), attemps)
     }
     fn run(&self) {
         loop {
@@ -230,6 +254,9 @@ pub enum Input {
     Cancel,
     NOP,
     Ping,
+    Attmpts(usize),
+    TcpTimeout(usize),
+    UdpTimeout(usize),
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -246,7 +273,7 @@ struct ScanMaster<O: Fn(Output) + Clone> {
     message_rx: Receiver<WorkerMessage>,
     message_tx: Sender<WorkerMessage>,
     ranges: ScanQueue,
-    config: ScannerConfig,
+    config: Arc<Mutex<ScannerConfig>>,
     state: ScannerState,
     input_rx: Receiver<Input>,
     output_tx: Sender<Output>,
@@ -264,7 +291,7 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
             message_rx,
             message_tx,
             ranges,
-            config: ScannerConfig::default(),
+            config: Arc::new(Mutex::new(ScannerConfig::default())),
             state: ScannerState::Running,
             input_rx,
             output,
@@ -307,15 +334,19 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
             self.state = ScannerState::Terminated;
         }
     }
+    fn config(&mut self) -> MutexGuard<ScannerConfig> {
+        self.config.lock().unwrap()
+    }
     fn thread_count_control(&mut self) {
-        if self.config.thread_count > self.workers.len() {
-            let diff = self.config.thread_count - self.workers.len();
+        let expected_count = self.config().thread_count;
+        if expected_count > self.workers.len() {
+            let diff = expected_count - self.workers.len();
             for _ in 0..diff {
                 self.spawn();
             }
             self.assign_work();
-        } else if self.config.thread_count < self.workers.len() {
-            let diff = self.workers.len() - self.config.thread_count;
+        } else if expected_count < self.workers.len() {
+            let diff = self.workers.len() - expected_count;
             self.try_close(diff)
         }
     }
@@ -331,7 +362,7 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
                 worker.state = WorkerState::Idle;
                 let stale = worker.stale;
                 worker.stale = false;
-                if !stale || !self.config.stale {
+                if !stale || !self.config().stale {
                     match port.protocol {
                         Protocol::Tcp => {
                             self.send_async_output(Output::TcpScan(host, port.number, state))
@@ -367,12 +398,21 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
                 self.try_terminate();
             }
             Input::Ping => {}
+            Input::Attmpts(count) => {
+                self.config().attemps = count;
+            }
+            Input::TcpTimeout(milis) => {
+                self.config().tcp_timeout = milis;
+            }
+            Input::UdpTimeout(milis) => {
+                self.config().udp_timeout = milis;
+            }
             Input::Cancel => {
                 self.stale_all();
                 self.ranges.clear();
             }
             Input::Stale(stale) => {
-                self.config.stale = stale;
+                self.config().stale = stale;
             }
             Input::TcpRange(host, from, to) => {
                 self.ranges.push(AddressRange {
@@ -404,7 +444,7 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
                 self.assign_work();
             }
             Input::Threads(count) => {
-                self.config.thread_count = count;
+                self.config().thread_count = count;
                 self.thread_count_control();
             }
             Input::NOP => {}
@@ -416,6 +456,7 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
         let id = self.id_counter;
         let (work_tx, work_rx) = crossbeam::channel::bounded(1);
         let message_tx = self.message_tx.clone();
+        let config = self.config.clone();
         let handle = WorkerHandle {
             id: self.id_counter,
             work_tx,
@@ -425,6 +466,7 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
                     id,
                     work_rx,
                     message_tx,
+                    config,
                 };
                 worker.run();
             })),
@@ -490,6 +532,7 @@ impl Scanner {
         let (output_tx, output_rx) = crossbeam::channel::unbounded();
         let mut scan_master = ScanMaster::new(output, input_rx, output_tx);
         let handle = std::thread::spawn(move || {
+            scan_master.thread_count_control();
             scan_master.listen();
         });
         let handle = Arc::new(Mutex::new(Some(handle)));
