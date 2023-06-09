@@ -7,6 +7,7 @@ pub struct ScannerBuilder {
     udp_timeout: Option<usize>,
     attemps: Option<usize>,
     stale: Option<bool>,
+    scans: Vec<(String, u16, u16, bool)>,
 }
 
 impl ScannerBuilder {
@@ -18,6 +19,16 @@ impl ScannerBuilder {
     pub fn attemps(self, value: usize) -> Self {
         let mut s = self;
         s.attemps = Some(value);
+        s
+    }
+    pub fn scan_tcp(self, host: String, from: u16, to: u16) -> Self {
+        let mut s = self;
+        s.scans.push((host, from, to, true));
+        s
+    }
+    pub fn scan_udp(self, host: String, from: u16, to: u16) -> Self {
+        let mut s = self;
+        s.scans.push((host, from, to, false));
         s
     }
     pub fn tcp_timeout(self, value: usize) -> Self {
@@ -52,9 +63,20 @@ impl ScannerBuilder {
             scanner.command(Input::UdpTimeout(val));
         }
     }
+    fn enqueue_jobs(&mut self, scanner: &Scanner) {
+        for (host, from, to, is_tcp) in self.scans.drain(..) {
+            if is_tcp {
+                scanner.command(Input::TcpRange(host, from, to));
+            } else {
+                scanner.command(Input::UdpRange(host, from, to));
+            }
+        }
+    }
     pub fn build<O: Fn(Output) + Send + Clone + 'static>(self, o: O) -> Scanner {
         let scanner = Scanner::new(o);
-        self.config(&scanner);
+        let mut s = self;
+        s.config(&scanner);
+        s.enqueue_jobs(&scanner);
         scanner
     }
     pub fn run(self) -> Vec<Output> {
