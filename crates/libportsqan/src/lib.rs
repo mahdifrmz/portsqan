@@ -72,7 +72,7 @@ impl ScannerBuilder {
             }
         }
     }
-    pub fn build<O: Fn(Output) + Send + Clone + 'static>(self, o: O) -> Scanner {
+    pub fn build<O: Fn(Output) + Send + 'static>(self, o: O) -> Scanner {
         let scanner = Scanner::new(o);
         let mut s = self;
         s.config(&scanner);

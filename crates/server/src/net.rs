@@ -1,5 +1,5 @@
 use std::{
-    net::{SocketAddr, TcpStream, UdpSocket},
+    net::{TcpStream, ToSocketAddrs, UdpSocket},
     time::Duration,
 };
 
@@ -25,7 +25,10 @@ pub fn scan_udp(host: String, number: u16, timeout: Duration, attemps: usize) ->
 }
 
 fn try_tcp(host: String, number: u16, timeout: Duration) -> Option<bool> {
-    let address = format!("{}:{}", host, number).parse::<SocketAddr>().ok()?;
+    let address = format!("{}:{}", host, number)
+        .to_socket_addrs()
+        .ok()?
+        .next()?;
     match TcpStream::connect_timeout(&address, timeout) {
         Ok(_) => Some(true),
         Err(e) => match e.kind() {
@@ -36,7 +39,7 @@ fn try_tcp(host: String, number: u16, timeout: Duration) -> Option<bool> {
 }
 fn try_udp(host: String, number: u16, timeout: Duration) -> Option<bool> {
     let address = format!("{}:{}", host, number);
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     if socket.send_to(&[], address).is_err() {
         return None;
     }

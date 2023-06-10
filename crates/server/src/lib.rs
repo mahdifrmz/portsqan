@@ -211,12 +211,14 @@ The channel has been probably closed by the scanner too early.",
         let config = self.config();
         let attemps = config.attemps;
         let timeout = config.tcp_timeout;
+        drop(config);
         net::scan_tcp(host, number, Duration::from_millis(timeout as u64), attemps)
     }
     fn udp(&self, host: String, number: u16) -> Option<bool> {
         let config = self.config();
         let attemps = config.attemps;
-        let timeout = config.tcp_timeout;
+        let timeout = config.udp_timeout;
+        drop(config);
         net::scan_udp(host, number, Duration::from_millis(timeout as u64), attemps)
     }
     fn run(&self) {
@@ -268,7 +270,7 @@ pub enum Output {
     // sync
     Ok,
 }
-struct ScanMaster<O: Fn(Output) + Clone> {
+struct ScanMaster<O: Fn(Output)> {
     workers: Vec<WorkerHandle>,
     message_rx: Receiver<WorkerMessage>,
     message_tx: Sender<WorkerMessage>,
@@ -281,7 +283,7 @@ struct ScanMaster<O: Fn(Output) + Clone> {
     id_counter: usize,
 }
 
-impl<O: Fn(Output) + Clone> ScanMaster<O> {
+impl<O: Fn(Output)> ScanMaster<O> {
     fn new(output: O, input_rx: Receiver<Input>, output_tx: Sender<Output>) -> ScanMaster<O> {
         let (message_tx, message_rx) = crossbeam::channel::unbounded();
         let workers = vec![];
@@ -300,8 +302,8 @@ impl<O: Fn(Output) + Clone> ScanMaster<O> {
         }
     }
     fn send_async_output(&self, output: Output) {
-        let out_fn = self.output.clone();
-        out_fn(output);
+        let cb = &self.output;
+        cb(output)
     }
     fn send_sync_output(&self, output: Output) {
         let _ = self.output_tx.send(output);
@@ -527,7 +529,7 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    pub fn new<O: Fn(Output) + Send + Clone + 'static>(output: O) -> Scanner {
+    pub fn new<O: Fn(Output) + Send + 'static>(output: O) -> Scanner {
         let (input_tx, input_rx) = crossbeam::channel::unbounded();
         let (output_tx, output_rx) = crossbeam::channel::unbounded();
         let mut scan_master = ScanMaster::new(output, input_rx, output_tx);

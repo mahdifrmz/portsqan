@@ -2,7 +2,7 @@ use server::Input;
 
 #[derive(Default)]
 pub struct Parser {
-    state: ReplState,
+    state: ReplConfig,
     fields: Vec<String>,
     pointer: usize,
     buffer: Option<Token>,
@@ -12,10 +12,9 @@ pub struct Parser {
 enum Token {
     Int(usize),
     String(String),
+    Boolean(bool),
     Tcp,
     Udp,
-    True,
-    False,
     EOF,
 }
 
@@ -30,8 +29,9 @@ pub enum Error {
 }
 
 #[derive(Default)]
-pub struct ReplState {
+pub struct ReplConfig {
     pub host: Option<String>,
+    pub autostop: bool,
 }
 
 impl Parser {
@@ -46,8 +46,8 @@ impl Parser {
         match field.parse::<usize>() {
             Ok(val) => Token::Int(val),
             Err(_) => match field.to_lowercase().as_str() {
-                "true" => Token::True,
-                "false" => Token::False,
+                "true" => Token::Boolean(true),
+                "false" => Token::Boolean(false),
                 "tcp" => Token::Tcp,
                 "udp" => Token::Udp,
                 _ => Token::String(field),
@@ -85,12 +85,23 @@ impl Parser {
             _ => Err(Error::InvalidParam(self.pointer)),
         }
     }
+    fn parse_boolean(&mut self) -> Result<bool, Error> {
+        let token = self.next();
+        match token {
+            Token::Boolean(value) => Ok(value),
+            _ => Err(Error::InvalidParam(self.pointer)),
+        }
+    }
     fn parse_config(&mut self) -> Result<Input, Error> {
         match self.parse_string()?.as_str() {
             "threads" | "thread" | "t" => Ok(Input::Threads(self.parse_number()?)),
             "tries" | "attemps" | "a" => Ok(Input::Attmpts(self.parse_number()?)),
             "tcp-timeout" | "timeout" | "tto" => Ok(Input::TcpTimeout(self.parse_number()?)),
-            "udp-timeout" | "uto" => Ok(Input::TcpTimeout(self.parse_number()?)),
+            "udp-timeout" | "uto" => Ok(Input::UdpTimeout(self.parse_number()?)),
+            "autostop" => {
+                self.state.autostop = self.parse_boolean()?;
+                Ok(Input::NOP)
+            }
             _ => Err(Error::InvalidParam(self.pointer)),
         }
     }
@@ -138,7 +149,8 @@ impl Parser {
                     self.state.host = Some(self.parse_string()?);
                     Ok(Input::NOP)
                 }
-                "ping" | "p" => Ok(Input::Ping),
+                "ping" => Ok(Input::Ping),
+                "pause" | "p" => Ok(Input::Stop),
                 "quit" | "q" | "exit" => Ok(Input::End),
                 "cancel" | "c" => Ok(Input::Cancel),
                 "resume" | "r" => Ok(Input::Cont),
@@ -150,7 +162,7 @@ impl Parser {
             Err(Error::Empty)
         }
     }
-    pub fn parse(&mut self, state: ReplState, text: String) -> (Result<Input, Error>, ReplState) {
+    pub fn parse(&mut self, state: ReplConfig, text: String) -> (Result<Input, Error>, ReplConfig) {
         self.state = state;
         self.fields = text.split(' ').map(|s| s.to_owned()).collect::<Vec<_>>();
         let rsl = self.parse_fields();
