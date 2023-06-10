@@ -1,146 +1,143 @@
-use std::{
-    process::exit,
-    sync::{Arc, Mutex},
-};
+mod repl;
 
+use std::process::exit;
+
+use clap::{command, Parser};
 use libportsqan::ScannerBuilder;
-use parser::{Parser, ReplConfig};
-use rustyline::{error::ReadlineError, DefaultEditor, ExternalPrinter};
-use server::{Input, Output};
+use repl::run_repl;
 
-enum TerminalState {
-    Log,
-    Repl,
+#[derive(Parser)]
+#[command(name = "Portsqan")]
+#[command(version = "0.1.0")]
+#[command(about = "Port scanning utility")]
+struct CliArgs {
+    host: String,
+    // scan
+    #[clap(long, short)]
+    from: Option<u16>,
+
+    #[clap(long, short)]
+    to: Option<u16>,
+
+    #[clap(long, short)]
+    protocol: Option<String>,
+
+    #[clap(long)]
+    exclude_from: Option<u16>,
+
+    #[clap(long)]
+    exclude_to: Option<u16>,
+    // config
+    #[clap(long)]
+    thread_count: Option<usize>,
+
+    #[clap(long)]
+    tcp_timeout: Option<usize>,
+
+    #[clap(long)]
+    udp_timeout: Option<usize>,
+
+    #[clap(long)]
+    attemps: Option<usize>,
+
+    #[clap(long)]
+    stale: Option<bool>,
 }
 
-struct Terminal<P: ExternalPrinter> {
-    buffered_output: Vec<Output>,
-    state: TerminalState,
-    printer: P,
-}
-
-impl<P: ExternalPrinter> Terminal<P> {
-    fn new(printer: P) -> Self {
-        Self {
-            buffered_output: vec![],
-            state: TerminalState::Log,
-            printer,
-        }
-    }
-
-    fn clear_scan_results(&mut self) {
-        self.buffered_output = self
-            .buffered_output
-            .drain(..)
-            .filter(|s| match s {
-                Output::TcpScan(_, _, _) | Output::UdpScan(_, _, _) => false,
-                _ => true,
-            })
-            .collect::<Vec<_>>()
-    }
-
-    fn print(&mut self, output: Output) {
-        let _ = self.printer.print(format!("| {:?}\n", output));
+fn zero_port_check(port: u16) {
+    if port == 0 {
+        eprintln!("ERROR: port number must be in (1,65535)!");
+        exit(1);
     }
 }
-
-fn run_server(config: ScannerBuilder) {
-    let (int_tx, int_rx) = crossbeam::channel::bounded(1);
-    let handler = move || {
-        int_tx.send(()).unwrap();
-    };
-    ctrlc::set_handler(handler).unwrap();
-
-    let mut rl = DefaultEditor::new().unwrap();
-    let terminal = Arc::new(Mutex::new(Terminal::new(
-        rl.create_external_printer().unwrap(),
-    )));
-    let tclone = terminal.clone();
-    let scanner = config.build(move |output| {
-        if let Ok(mut terminal) = tclone.lock() {
-            match terminal.state {
-                TerminalState::Log => terminal.print(output),
-                TerminalState::Repl => terminal.buffered_output.push(output),
-            }
-        }
-    });
-    let mut state = ReplConfig {
-        host: None,
-        autostop: false,
-    };
-    let mut parser = Parser::default();
-
-    loop {
-        int_rx.recv().unwrap();
-        if state.autostop {
-            terminal.lock().unwrap().state = TerminalState::Repl;
-            scanner.command(Input::Stop);
-        }
-        let exit = loop {
-            let prompt = format!("{}> ", state.host.clone().unwrap_or("".to_owned()));
-            match rl.readline(prompt.as_str()) {
-                Ok(line) => {
-                    let _ = rl.add_history_entry(&line);
-                    if line.trim().len() > 0 {
-                        let (rsl, new_state) = parser.parse(state, line);
-                        state = new_state;
-                        match rsl {
-                            Ok(input) => {
-                                match input {
-                                    Input::NOP => {}
-                                    Input::End => break true,
-                                    Input::Cancel => {
-                                        if let Ok(mut terminal) = terminal.lock() {
-                                            terminal.clear_scan_results();
-                                            if let Some(output) = scanner.command(input) {
-                                                terminal.print(output)
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        if let Ok(mut terminal) = terminal.lock() {
-                                            if let Some(output) = scanner.command(input) {
-                                                terminal.print(output)
-                                            }
-                                        }
-                                    }
-                                };
-                            }
-                            Err(err) => eprintln!("Error: {:?}", err),
-                        }
-                    }
-                }
-                Err(ReadlineError::Eof) => break false,
-                Err(ReadlineError::Interrupted) => {
-                    eprintln!("ABORTING...");
-                    exit(0);
-                }
-                Err(_) => panic!("FATAL: Failed to read STDIN"),
-            }
-        };
-        if exit {
-            break;
-        }
-        if let Ok(mut terminal) = terminal.lock() {
-            while terminal.buffered_output.len() > 0 {
-                let o = terminal.buffered_output.remove(0);
-                terminal.print(o);
-            }
-            terminal.state = TerminalState::Log;
-        }
-        scanner.command(Input::Cont);
+fn invalid_range() -> ! {
+    eprintln!("invalid port range");
+    exit(1)
+}
+fn invalid_exclusion() -> ! {
+    eprintln!("invalid exclusion range");
+    exit(1)
+}
+fn check_range(from: u16, to: u16) {
+    zero_port_check(from);
+    zero_port_check(to);
+    if to < from {
+        invalid_range();
     }
-    scanner.command(Input::End);
-    scanner.join();
 }
 
 fn main() {
-    run_server(
-        ScannerBuilder::default()
-            .thread_count(1)
-            .tcp_timeout(1000)
-            .scan_tcp("116.203.221.27".to_owned(), 1, 10)
-            .stale(true)
-            .attemps(1),
-    )
+    let mut builder = ScannerBuilder::default();
+    let args = CliArgs::parse();
+    if let Some(value) = args.thread_count {
+        builder = builder.thread_count(value);
+    }
+    if let Some(value) = args.tcp_timeout {
+        builder = builder.tcp_timeout(value);
+    }
+    if let Some(value) = args.udp_timeout {
+        builder = builder.udp_timeout(value);
+    }
+    if let Some(value) = args.attemps {
+        builder = builder.attemps(value);
+    }
+    if let Some(value) = args.stale {
+        builder = builder.stale(value);
+    }
+
+    let is_tcp = args
+        .protocol
+        .unwrap_or("tcp".to_owned())
+        .to_lowercase()
+        .as_str()
+        == "tcp";
+
+    let from = args.from.unwrap_or(1);
+    let to = args.to.unwrap_or(0xffff);
+    check_range(from, to);
+
+    let mut ranges = if let Some((ex_f, ex_t)) = match (args.exclude_from, args.exclude_to) {
+        (None, None) => None,
+        (Some(f), Some(t)) => Some((f, t)),
+        _ => invalid_exclusion(),
+    } {
+        check_range(ex_f, ex_t);
+        range(from, to, ex_f, ex_t)
+    } else {
+        vec![(from, to)]
+    };
+
+    for r in ranges.drain(..) {
+        let (from, to) = r;
+        if is_tcp {
+            builder = builder.scan_tcp(args.host.clone(), from, to);
+        } else {
+            builder = builder.scan_udp(args.host.clone(), from, to);
+        }
+    }
+
+    run_repl(builder);
+}
+
+fn range(f: u16, t: u16, xf: u16, xt: u16) -> Vec<(u16, u16)> {
+    let mut ranges = vec![];
+    let mut marker = 0;
+    let mut state = false;
+    for i in f..t {
+        if i > xt || i < xf {
+            if !state {
+                state = true;
+                marker = i;
+            }
+        } else {
+            if state {
+                state = false;
+                ranges.push((marker, i - 1));
+            }
+        }
+    }
+    if state {
+        ranges.push((marker, t))
+    }
+    ranges
 }
