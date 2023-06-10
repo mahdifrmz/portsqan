@@ -13,20 +13,21 @@ enum TerminalState {
     Repl,
 }
 
-struct Terminal {
+struct Terminal<P: ExternalPrinter> {
     buffered_output: Vec<Output>,
     state: TerminalState,
+    printer: P,
 }
 
-impl Default for Terminal {
-    fn default() -> Self {
+impl<P: ExternalPrinter> Terminal<P> {
+    fn new(printer: P) -> Self {
         Self {
             buffered_output: vec![],
             state: TerminalState::Log,
+            printer,
         }
     }
-}
-impl Terminal {
+
     fn clear_scan_results(&mut self) {
         self.buffered_output = self
             .buffered_output
@@ -37,10 +38,10 @@ impl Terminal {
             })
             .collect::<Vec<_>>()
     }
-}
 
-fn print_scanner_output<P: ExternalPrinter>(printer: Arc<Mutex<P>>, output: Output) {
-    let _ = printer.lock().unwrap().print(format!("| {:?}\n", output));
+    fn print(&mut self, output: Output) {
+        let _ = self.printer.print(format!("| {:?}\n", output));
+    }
 }
 
 fn run_server(config: ScannerBuilder) {
@@ -50,15 +51,15 @@ fn run_server(config: ScannerBuilder) {
     };
     ctrlc::set_handler(handler).unwrap();
 
-    let terminal = Arc::new(Mutex::new(Terminal::default()));
-    let tclone = terminal.clone();
     let mut rl = DefaultEditor::new().unwrap();
-    let printer = Arc::new(Mutex::new(rl.create_external_printer().unwrap()));
-    let pclone = printer.clone();
+    let terminal = Arc::new(Mutex::new(Terminal::new(
+        rl.create_external_printer().unwrap(),
+    )));
+    let tclone = terminal.clone();
     let scanner = config.build(move |output| {
         if let Ok(mut terminal) = tclone.lock() {
             match terminal.state {
-                TerminalState::Log => print_scanner_output(pclone.clone(), output),
+                TerminalState::Log => terminal.print(output),
                 TerminalState::Repl => terminal.buffered_output.push(output),
             }
         }
@@ -89,14 +90,18 @@ fn run_server(config: ScannerBuilder) {
                                     Input::NOP => {}
                                     Input::End => break true,
                                     Input::Cancel => {
-                                        terminal.lock().unwrap().clear_scan_results();
-                                        if let Some(output) = scanner.command(input) {
-                                            print_scanner_output(printer.clone(), output)
+                                        if let Ok(mut terminal) = terminal.lock() {
+                                            terminal.clear_scan_results();
+                                            if let Some(output) = scanner.command(input) {
+                                                terminal.print(output)
+                                            }
                                         }
                                     }
                                     _ => {
-                                        if let Some(output) = scanner.command(input) {
-                                            print_scanner_output(printer.clone(), output)
+                                        if let Ok(mut terminal) = terminal.lock() {
+                                            if let Some(output) = scanner.command(input) {
+                                                terminal.print(output)
+                                            }
                                         }
                                     }
                                 };
@@ -117,8 +122,9 @@ fn run_server(config: ScannerBuilder) {
             break;
         }
         if let Ok(mut terminal) = terminal.lock() {
-            for o in terminal.buffered_output.drain(..) {
-                print_scanner_output(printer.clone(), o);
+            while terminal.buffered_output.len() > 0 {
+                let o = terminal.buffered_output.remove(0);
+                terminal.print(o);
             }
             terminal.state = TerminalState::Log;
         }
