@@ -116,7 +116,7 @@ fn main() {
         }
     }
 
-    run_repl(builder);
+    run_repl(builder, args.host.clone());
 }
 
 fn range(f: u16, t: u16, xf: u16, xt: u16) -> Vec<(u16, u16)> {

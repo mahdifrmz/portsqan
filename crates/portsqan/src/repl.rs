@@ -6,11 +6,11 @@ use std::{
 use libportsqan::ScannerBuilder;
 use parser::{Parser, ReplConfig};
 use rustyline::{error::ReadlineError, DefaultEditor, ExternalPrinter};
-use server::{Input, Output};
+use server::{Input, Output, Scanner};
 
 enum TerminalState {
     Log,
-    Repl,
+    Store,
 }
 
 struct Terminal<P: ExternalPrinter> {
@@ -39,12 +39,42 @@ impl<P: ExternalPrinter> Terminal<P> {
             .collect::<Vec<_>>()
     }
 
+    fn flush(&mut self) {
+        while self.buffered_output.len() > 0 {
+            let o = self.buffered_output.remove(0);
+            self.print(o);
+        }
+    }
+
     fn print(&mut self, output: Output) {
         let _ = self.printer.print(format!("| {:?}\n", output));
     }
 }
 
-pub fn run_repl(config: ScannerBuilder) {
+fn stop<P: ExternalPrinter>(scanner: &Scanner, terminal: Arc<Mutex<Terminal<P>>>, silent: bool) {
+    if let Ok(mut terminal) = terminal.lock() {
+        terminal.state = TerminalState::Store;
+        if let Some(output) = scanner.command(Input::Stop) {
+            if !silent {
+                terminal.print(output);
+            }
+        }
+    }
+}
+
+fn resume<P: ExternalPrinter>(scanner: &Scanner, terminal: Arc<Mutex<Terminal<P>>>, silent: bool) {
+    if let Ok(mut terminal) = terminal.lock() {
+        terminal.state = TerminalState::Log;
+        terminal.flush();
+        if let Some(output) = scanner.command(Input::Cont) {
+            if !silent {
+                terminal.print(output);
+            }
+        }
+    }
+}
+
+pub fn run_repl(config: ScannerBuilder, host: String) {
     let (int_tx, int_rx) = crossbeam::channel::bounded(1);
     let handler = move || {
         int_tx.send(()).unwrap();
@@ -60,21 +90,20 @@ pub fn run_repl(config: ScannerBuilder) {
         if let Ok(mut terminal) = tclone.lock() {
             match terminal.state {
                 TerminalState::Log => terminal.print(output),
-                TerminalState::Repl => terminal.buffered_output.push(output),
+                TerminalState::Store => terminal.buffered_output.push(output),
             }
         }
     });
     let mut state = ReplConfig {
-        host: None,
-        autostop: false,
+        host: Some(host),
+        autostop: true,
     };
     let mut parser = Parser::default();
 
     loop {
         int_rx.recv().unwrap();
         if state.autostop {
-            terminal.lock().unwrap().state = TerminalState::Repl;
-            scanner.command(Input::Stop);
+            stop(&scanner, terminal.clone(), true);
         }
         let exit = loop {
             let prompt = format!("{}> ", state.host.clone().unwrap_or("".to_owned()));
@@ -87,7 +116,8 @@ pub fn run_repl(config: ScannerBuilder) {
                         match rsl {
                             Ok(input) => {
                                 match input {
-                                    Input::NOP => {}
+                                    Input::Stop => stop(&scanner, terminal.clone(), false),
+                                    Input::Cont => resume(&scanner, terminal.clone(), false),
                                     Input::End => break true,
                                     Input::Cancel => {
                                         if let Ok(mut terminal) = terminal.lock() {
@@ -121,14 +151,7 @@ pub fn run_repl(config: ScannerBuilder) {
         if exit {
             break;
         }
-        if let Ok(mut terminal) = terminal.lock() {
-            while terminal.buffered_output.len() > 0 {
-                let o = terminal.buffered_output.remove(0);
-                terminal.print(o);
-            }
-            terminal.state = TerminalState::Log;
-        }
-        scanner.command(Input::Cont);
+        resume(&scanner, terminal.clone(), true)
     }
     scanner.command(Input::End);
     scanner.join();
